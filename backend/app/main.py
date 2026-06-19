@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import csv
+import io
 import os
-import shutil
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from uuid import uuid4
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlmodel import Field, Session, SQLModel, create_engine, select
+
+from .skills import process_with_skill, skill_catalog
 
 try:
     from faster_whisper import WhisperModel
@@ -45,6 +48,11 @@ class MurmurCreate(BaseModel):
     space: Optional[str] = None
 
 
+class MurmurProcess(BaseModel):
+    transcript: str
+    skill: Optional[str] = None
+
+
 class MurmurRead(BaseModel):
     id: str
     title: str
@@ -56,10 +64,10 @@ class MurmurRead(BaseModel):
     created_at: datetime
 
 
-app = FastAPI(title="Murmur API", version="0.2.0")
+app = FastAPI(title="Murmur API", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:5173").split(","),
+    allow_origins=[origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if origin.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -73,11 +81,7 @@ def get_model():
     if WhisperModel is None:
         raise HTTPException(status_code=503, detail="faster-whisper is not installed correctly")
     if _model is None:
-        _model = WhisperModel(
-            WHISPER_MODEL,
-            device=WHISPER_DEVICE,
-            compute_type=WHISPER_COMPUTE_TYPE,
-        )
+        _model = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE)
     return _model
 
 
@@ -102,26 +106,56 @@ def build_title(text: str) -> str:
     return cleaned if len(cleaned) <= 64 else f"{cleaned[:61]}..."
 
 
+def save_murmur(transcript: str, source: str, space: Optional[str] = None, language: Optional[str] = None, duration: Optional[float] = None, title: Optional[str] = None) -> Murmur:
+    murmur = Murmur(
+        title=title or build_title(transcript),
+        transcript=transcript,
+        space=space or detect_space(transcript),
+        source=source,
+        language=language,
+        duration_seconds=duration,
+    )
+    with Session(engine) as session:
+        session.add(murmur)
+        session.commit()
+        session.refresh(murmur)
+    return murmur
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     SQLModel.metadata.create_all(engine)
 
 
 @app.get("/health")
-def health() -> dict:
+def health() -> dict[str, Any]:
     return {
         "status": "ok",
+        "version": app.version,
         "transcription": "faster-whisper",
         "model": WHISPER_MODEL,
         "database": "sqlite" if DATABASE_URL.startswith("sqlite") else "postgres",
+        "skills": len(skill_catalog()),
     }
+
+
+@app.get("/api/skills")
+def list_skills() -> list[dict[str, str]]:
+    return skill_catalog()
+
+
+@app.post("/api/process")
+def process_murmur(payload: MurmurProcess) -> dict[str, Any]:
+    transcript = payload.transcript.strip()
+    if not transcript:
+        raise HTTPException(status_code=422, detail="Transcript cannot be empty")
+    return process_with_skill(transcript, payload.skill)
 
 
 @app.get("/api/murmurs", response_model=list[MurmurRead])
 def list_murmurs(space: Optional[str] = None, query: Optional[str] = None) -> list[Murmur]:
     with Session(engine) as session:
-        statement = select(Murmur).order_by(Murmur.created_at.desc())
-        rows = session.exec(statement).all()
+        rows = session.exec(select(Murmur).order_by(Murmur.created_at.desc())).all()
         if space and space != "All murmurs":
             rows = [row for row in rows if row.space.lower() == space.lower()]
         if query:
@@ -135,24 +169,46 @@ def create_murmur(payload: MurmurCreate) -> Murmur:
     transcript = payload.transcript.strip()
     if not transcript:
         raise HTTPException(status_code=422, detail="Transcript cannot be empty")
-    murmur = Murmur(
-        title=payload.title or build_title(transcript),
-        transcript=transcript,
-        space=payload.space or detect_space(transcript),
-        source="text",
-    )
+    return save_murmur(transcript, "text", payload.space, title=payload.title)
+
+
+@app.delete("/api/murmurs/{murmur_id}", status_code=204)
+def delete_murmur(murmur_id: str) -> Response:
     with Session(engine) as session:
-        session.add(murmur)
+        murmur = session.get(Murmur, murmur_id)
+        if not murmur:
+            raise HTTPException(status_code=404, detail="Murmur not found")
+        session.delete(murmur)
         session.commit()
-        session.refresh(murmur)
-    return murmur
+    return Response(status_code=204)
+
+
+@app.get("/api/stats")
+def stats() -> dict[str, Any]:
+    with Session(engine) as session:
+        rows = session.exec(select(Murmur)).all()
+    by_space: dict[str, int] = {}
+    voice_seconds = 0.0
+    for row in rows:
+        by_space[row.space] = by_space.get(row.space, 0) + 1
+        voice_seconds += row.duration_seconds or 0
+    return {"total": len(rows), "by_space": by_space, "voice_minutes": round(voice_seconds / 60, 1)}
+
+
+@app.get("/api/export.csv")
+def export_csv() -> Response:
+    with Session(engine) as session:
+        rows = session.exec(select(Murmur).order_by(Murmur.created_at.desc())).all()
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["id", "title", "transcript", "space", "source", "language", "duration_seconds", "created_at"])
+    for row in rows:
+        writer.writerow([row.id, row.title, row.transcript, row.space, row.source, row.language or "", row.duration_seconds or "", row.created_at.isoformat()])
+    return Response(buffer.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=murmurs.csv"})
 
 
 @app.post("/api/transcribe", response_model=MurmurRead)
-async def transcribe_audio(
-    audio: UploadFile = File(...),
-    space: Optional[str] = Form(None),
-) -> Murmur:
+async def transcribe_audio(audio: UploadFile = File(...), space: Optional[str] = Form(None)) -> Murmur:
     suffix = Path(audio.filename or "capture.webm").suffix or ".webm"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
         total = 0
@@ -167,28 +223,17 @@ async def transcribe_audio(
 
     try:
         model = get_model()
-        segments, info = model.transcribe(
-            temp_path,
-            beam_size=5,
-            vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 450},
-        )
+        segments, info = model.transcribe(temp_path, beam_size=5, vad_filter=True, vad_parameters={"min_silence_duration_ms": 450})
         transcript = " ".join(segment.text.strip() for segment in segments).strip()
         if not transcript:
             raise HTTPException(status_code=422, detail="No speech was detected")
-        murmur = Murmur(
-            title=build_title(transcript),
-            transcript=transcript,
-            space=space or detect_space(transcript),
-            source="voice",
-            language=getattr(info, "language", None),
-            duration_seconds=getattr(info, "duration", None),
+        return save_murmur(
+            transcript,
+            "voice",
+            space,
+            getattr(info, "language", None),
+            getattr(info, "duration", None),
         )
-        with Session(engine) as session:
-            session.add(murmur)
-            session.commit()
-            session.refresh(murmur)
-        return murmur
     finally:
         try:
             os.unlink(temp_path)
