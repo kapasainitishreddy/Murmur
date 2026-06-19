@@ -1,0 +1,18 @@
+services:
+  api:
+    build: ./backend
+    environment:
+      DATABASE_URL: sqlite:////data/murmur.db
+      WHISPER_MODEL: small
+      WHISPER_DEVICE: cpu
+      WHISPER_COMPUTE_TYPE: int8
+      CORS_ORIGINS: http://localhost:5173
+    volumes:
+      - murmur_data:/data
+      - whisper_cache:/root/.cache/huggingface
+    ports:
+      - "8000:8000"
+
+volumes:
+  murmur_data:
+  whisper_cache:
