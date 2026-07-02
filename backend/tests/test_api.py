@@ -68,6 +68,70 @@ def test_structured_skill_processing():
     assert len(inventory.json()["result"]["items"]) == 2
 
 
+def test_create_enriches_tags_sentiment_and_duplicates():
+    first = client.post("/api/murmurs", json={"transcript": "The payment button crashes and the checkout is broken."})
+    assert first.status_code == 200
+    body = first.json()
+    assert isinstance(body["tags"], list) and body["tags"]
+    assert body["sentiment"] == "negative"
+    assert body["summary"]
+    assert body["duplicate_of"] is None
+
+    dupe = client.post("/api/murmurs", json={"transcript": "The payment button crashes and checkout is broken."})
+    assert dupe.status_code == 200
+    assert dupe.json()["duplicate_of"] is not None
+
+
+def test_semantic_search_and_related_and_tags():
+    client.post("/api/murmurs", json={"transcript": "I hid the spare house key under the garden gnome."})
+    search = client.get("/api/search", params={"q": "where did I put the key"})
+    assert search.status_code == 200
+    assert search.json()["results"]
+    assert any("key" in item["transcript"].lower() for item in search.json()["results"])
+
+    created = client.post("/api/murmurs", json={"transcript": "Remember the spare key is near the gnome by the door."}).json()
+    related = client.get(f"/api/murmurs/{created['id']}/related")
+    assert related.status_code == 200
+    assert "related" in related.json()
+
+    tags = client.get("/api/tags")
+    assert tags.status_code == 200
+    assert "tags" in tags.json()
+
+
+def test_tasks_timeline_and_exports():
+    client.post("/api/murmurs", json={"transcript": "Call the plumber tomorrow and email the landlord on Friday."})
+    tasks = client.get("/api/tasks")
+    assert tasks.status_code == 200
+    assert tasks.json()["count"] >= 1
+    assert any(task["due"] for task in tasks.json()["tasks"])
+
+    timeline = client.get("/api/timeline")
+    assert timeline.status_code == 200
+    assert timeline.json()["days"]
+
+    for path, media in [("/api/export.json", "application/json"), ("/api/export.txt", "text/plain"), ("/api/calendar.ics", "text/calendar")]:
+        response = client.get(path)
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith(media)
+    assert "BEGIN:VCALENDAR" in client.get("/api/calendar.ics").text
+
+
+def test_integrations_and_digest():
+    status = client.get("/api/integrations")
+    assert status.status_code == 200
+    assert set(status.json().keys()) == {"slack", "teams", "notion", "email"}
+
+    digest = client.get("/api/digest")
+    assert digest.status_code == 200
+    assert "subject" in digest.json()
+    assert digest.json()["can_email"] is False
+
+    # Sending should fail cleanly when email is not configured.
+    send = client.post("/api/digest/send")
+    assert send.status_code == 503
+
+
 def test_stats_export_delete_and_validation():
     empty = client.post("/api/murmurs", json={"transcript": "   "})
     assert empty.status_code == 422
