@@ -1,10 +1,13 @@
 name: Murmur CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: murmur-ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   frontend:
