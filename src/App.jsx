@@ -184,14 +184,14 @@ export default function App() {
     setProcessing(true);
     setError('');
     try {
+      const tags = tagsFromInput(editTags);
       const saved = await updateMurmur(selected.id, {
         title: editTitle,
         transcript: editTranscript,
         space: editSpace,
-        tags: editTags,
+        tags: tagsFromInput(editTags),
         pinned: editPinned,
       });
-      const tags = tagsFromInput(editTags);
       const normalizedSaved = { ...saved, tags: saved.tags || tags, pinned: Boolean(saved.pinned) };
       setItems(prev => prev
         .map(item => item.id === normalizedSaved.id ? normalizedSaved : item)
