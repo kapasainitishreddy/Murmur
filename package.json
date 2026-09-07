@@ -1,12 +1,16 @@
 {
   "name": "murmur-app",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:source": "node tests/frontend-release-contract.test.mjs",
+    "test:backend-source": "python -m pytest -q backend/tests/test_portability.py backend/tests/test_upload_policy.py backend/tests/test_transcribe_source_contract.py backend/tests/test_data_ownership_source_contract.py",
+    "verify:source": "npm run test:source && npm run test:backend-source",
+    "verify": "npm run verify:source && npm run build"
   },
   "dependencies": {
     "@vitejs/plugin-react": "4.3.4",
