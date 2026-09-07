@@ -21,6 +21,34 @@ export async function createTextMurmur(transcript) {
   }));
 }
 
+export async function updateMurmur(id, patch) {
+  return parse(await fetch(`${API_URL}/api/murmurs/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  }));
+}
+
+export async function deleteMurmur(id) {
+  return parse(await fetch(`${API_URL}/api/murmurs/${encodeURIComponent(id)}`, { method: 'DELETE' }));
+}
+
+export async function eraseAllMurmurs() {
+  return parse(await fetch(`${API_URL}/api/murmurs`, { method: 'DELETE' }));
+}
+
+export async function exportBackup() {
+  return parse(await fetch(`${API_URL}/api/export.json`));
+}
+
+export async function restoreBackup(backup, mode = 'replace') {
+  return parse(await fetch(`${API_URL}/api/restore`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ backup, mode }),
+  }));
+}
+
 export async function transcribeRecording(blob) {
   const body = new FormData();
   body.append('audio', blob, `murmur-${Date.now()}.webm`);
@@ -39,15 +67,11 @@ export async function processMurmur(transcript, skill = null) {
   }));
 }
 
-export async function deleteMurmur(id) {
-  return parse(await fetch(`${API_URL}/api/murmurs/${id}`, { method: 'DELETE' }));
-}
-
 export async function fetchStats() {
   return parse(await fetch(`${API_URL}/api/stats`));
 }
 
-export function exportUrl() {
+export function exportCsvUrl() {
   return `${API_URL}/api/export.csv`;
 }
 
