@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 
+from .portability import safe_csv_cell
 from .skills import process_with_skill, skill_catalog
 
 try:
@@ -203,7 +204,16 @@ def export_csv() -> Response:
     writer = csv.writer(buffer)
     writer.writerow(["id", "title", "transcript", "space", "source", "language", "duration_seconds", "created_at"])
     for row in rows:
-        writer.writerow([row.id, row.title, row.transcript, row.space, row.source, row.language or "", row.duration_seconds or "", row.created_at.isoformat()])
+        writer.writerow([
+            safe_csv_cell(row.id),
+            safe_csv_cell(row.title),
+            safe_csv_cell(row.transcript),
+            safe_csv_cell(row.space),
+            safe_csv_cell(row.source),
+            safe_csv_cell(row.language or ""),
+            row.duration_seconds or "",
+            row.created_at.isoformat(),
+        ])
     return Response(buffer.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=murmurs.csv"})
 
 
