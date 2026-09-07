@@ -16,7 +16,8 @@ assert.equal(app.includes('Offline preview'), false, 'offline state must not pre
 
 assert.match(app, /editTags/);
 assert.match(app, /editPinned/);
-assert.match(app, /tags:\s*editTags/);
+assert.match(app, /tags:\s*tagsFromInput\(editTags\)/, 'comma-separated UI tags must be converted to an array before the API call');
+assert.equal(app.includes('tags: editTags,'), false, 'raw tag input must never be sent where the backend expects a list');
 assert.match(app, /pinned:\s*editPinned/);
 assert.match(app, /Pinned/);
 
