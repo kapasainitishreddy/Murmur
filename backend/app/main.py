@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import os
 import tempfile
 from datetime import datetime, timezone
@@ -10,10 +11,11 @@ from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field as PydanticField
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 
 from .portability import BackupValidationError, build_backup, safe_csv_cell, validate_backup
+from .schema_migration import migrate_murmur_table
 from .skills import process_with_skill, skill_catalog
 from .upload_policy import AudioUploadError, choose_audio_suffix
 
@@ -27,9 +29,15 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "40"))
+MAX_TAGS = 32
+MAX_TAG_LENGTH = 64
 
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(DATABASE_URL, connect_args=connect_args)
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class Murmur(SQLModel, table=True):
@@ -40,19 +48,26 @@ class Murmur(SQLModel, table=True):
     source: str = "text"
     language: Optional[str] = None
     duration_seconds: Optional[float] = None
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), index=True)
+    created_at: datetime = Field(default_factory=now_utc, index=True)
+    updated_at: datetime = Field(default_factory=now_utc, index=True)
+    tags_json: str = "[]"
+    pinned: bool = Field(default=False, index=True)
 
 
 class MurmurCreate(BaseModel):
     transcript: str
     title: Optional[str] = None
     space: Optional[str] = None
+    tags: list[str] = PydanticField(default_factory=list)
+    pinned: bool = False
 
 
 class MurmurUpdate(BaseModel):
     title: Optional[str] = None
     transcript: Optional[str] = None
     space: Optional[str] = None
+    tags: Optional[list[str]] = None
+    pinned: Optional[bool] = None
 
 
 class MurmurRestore(BaseModel):
@@ -74,9 +89,12 @@ class MurmurRead(BaseModel):
     language: Optional[str]
     duration_seconds: Optional[float]
     created_at: datetime
+    updated_at: datetime
+    tags: list[str] = PydanticField(default_factory=list)
+    pinned: bool = False
 
 
-app = FastAPI(title="Murmur API", version="0.4.0")
+app = FastAPI(title="Murmur API", version="0.5.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if origin.strip()],
@@ -118,7 +136,66 @@ def build_title(text: str) -> str:
     return cleaned if len(cleaned) <= 64 else f"{cleaned[:61]}..."
 
 
-def save_murmur(transcript: str, source: str, space: Optional[str] = None, language: Optional[str] = None, duration: Optional[float] = None, title: Optional[str] = None) -> Murmur:
+def normalize_tags(tags: list[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in tags:
+        tag = raw.strip()
+        if not tag:
+            continue
+        if len(tag) > MAX_TAG_LENGTH:
+            raise HTTPException(status_code=422, detail=f"Tags may be at most {MAX_TAG_LENGTH} characters")
+        key = tag.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(tag)
+        if len(normalized) > MAX_TAGS:
+            raise HTTPException(status_code=422, detail=f"A murmur may have at most {MAX_TAGS} tags")
+    return normalized
+
+
+def serialize_tags(tags: list[str]) -> str:
+    return json.dumps(normalize_tags(tags), ensure_ascii=False, separators=(",", ":"))
+
+
+def deserialize_tags(raw: str) -> list[str]:
+    try:
+        value = json.loads(raw or "[]")
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(value, list) or not all(isinstance(tag, str) for tag in value):
+        return []
+    return value[:MAX_TAGS]
+
+
+def murmur_read(murmur: Murmur) -> dict[str, Any]:
+    return {
+        "id": murmur.id,
+        "title": murmur.title,
+        "transcript": murmur.transcript,
+        "space": murmur.space,
+        "source": murmur.source,
+        "language": murmur.language,
+        "duration_seconds": murmur.duration_seconds,
+        "created_at": murmur.created_at,
+        "updated_at": murmur.updated_at,
+        "tags": deserialize_tags(murmur.tags_json),
+        "pinned": murmur.pinned,
+    }
+
+
+def save_murmur(
+    transcript: str,
+    source: str,
+    space: Optional[str] = None,
+    language: Optional[str] = None,
+    duration: Optional[float] = None,
+    title: Optional[str] = None,
+    tags: Optional[list[str]] = None,
+    pinned: bool = False,
+) -> Murmur:
+    instant = now_utc()
     murmur = Murmur(
         title=title or build_title(transcript),
         transcript=transcript,
@@ -126,6 +203,10 @@ def save_murmur(transcript: str, source: str, space: Optional[str] = None, langu
         source=source,
         language=language,
         duration_seconds=duration,
+        created_at=instant,
+        updated_at=instant,
+        tags_json=serialize_tags(tags or []),
+        pinned=pinned,
     )
     with Session(engine) as session:
         session.add(murmur)
@@ -135,7 +216,6 @@ def save_murmur(transcript: str, source: str, space: Optional[str] = None, langu
 
 
 def murmur_to_backup_record(murmur: Murmur) -> dict[str, Any]:
-    created_at = murmur.created_at.isoformat()
     return {
         "id": murmur.id,
         "title": murmur.title,
@@ -144,10 +224,10 @@ def murmur_to_backup_record(murmur: Murmur) -> dict[str, Any]:
         "source": murmur.source,
         "language": murmur.language,
         "duration_seconds": murmur.duration_seconds,
-        "created_at": created_at,
-        "updated_at": created_at,
-        "tags": [],
-        "pinned": False,
+        "created_at": murmur.created_at.isoformat(),
+        "updated_at": murmur.updated_at.isoformat(),
+        "tags": deserialize_tags(murmur.tags_json),
+        "pinned": murmur.pinned,
     }
 
 
@@ -161,6 +241,7 @@ def parse_backup_timestamp(value: str) -> datetime:
 @app.on_event("startup")
 def on_startup() -> None:
     SQLModel.metadata.create_all(engine)
+    migrate_murmur_table(engine)
 
 
 @app.get("/health")
@@ -189,19 +270,27 @@ def process_murmur(payload: MurmurProcess) -> dict[str, Any]:
 
 
 @app.get("/api/murmurs", response_model=list[MurmurRead])
-def list_murmurs(space: Optional[str] = None, query: Optional[str] = None) -> list[Murmur]:
+def list_murmurs(space: Optional[str] = None, query: Optional[str] = None) -> list[dict[str, Any]]:
     with Session(engine) as session:
-        rows = session.exec(select(Murmur).order_by(Murmur.created_at.desc())).all()
-        if space and space != "All murmurs":
-            rows = [row for row in rows if row.space.lower() == space.lower()]
-        if query:
-            q = query.lower()
-            rows = [row for row in rows if q in row.title.lower() or q in row.transcript.lower()]
-        return rows
+        rows = session.exec(select(Murmur)).all()
+    rows.sort(key=lambda row: (bool(row.pinned), row.created_at), reverse=True)
+    if space and space != "All murmurs":
+        rows = [row for row in rows if row.space.lower() == space.lower()]
+    if query:
+        q = query.lower()
+        rows = [
+            row
+            for row in rows
+            if q in row.title.lower()
+            or q in row.transcript.lower()
+            or q in row.space.lower()
+            or any(q in tag.lower() for tag in deserialize_tags(row.tags_json))
+        ]
+    return [murmur_read(row) for row in rows]
 
 
 @app.post("/api/murmurs", response_model=MurmurRead)
-def create_murmur(payload: MurmurCreate) -> Murmur:
+def create_murmur(payload: MurmurCreate) -> dict[str, Any]:
     transcript = payload.transcript.strip()
     if not transcript:
         raise HTTPException(status_code=422, detail="Transcript cannot be empty")
@@ -211,12 +300,26 @@ def create_murmur(payload: MurmurCreate) -> Murmur:
     space = payload.space.strip() if payload.space is not None else None
     if payload.space is not None and not space:
         raise HTTPException(status_code=422, detail="Space cannot be empty")
-    return save_murmur(transcript, "text", space, title=title)
+    murmur = save_murmur(
+        transcript,
+        "text",
+        space,
+        title=title,
+        tags=payload.tags,
+        pinned=payload.pinned,
+    )
+    return murmur_read(murmur)
 
 
 @app.patch("/api/murmurs/{murmur_id}", response_model=MurmurRead)
-def update_murmur(murmur_id: str, payload: MurmurUpdate) -> Murmur:
-    if payload.title is None and payload.transcript is None and payload.space is None:
+def update_murmur(murmur_id: str, payload: MurmurUpdate) -> dict[str, Any]:
+    if (
+        payload.title is None
+        and payload.transcript is None
+        and payload.space is None
+        and payload.tags is None
+        and payload.pinned is None
+    ):
         raise HTTPException(status_code=422, detail="At least one field must be provided")
 
     with Session(engine) as session:
@@ -239,11 +342,16 @@ def update_murmur(murmur_id: str, payload: MurmurUpdate) -> Murmur:
             if not space:
                 raise HTTPException(status_code=422, detail="Space cannot be empty")
             murmur.space = space
+        if payload.tags is not None:
+            murmur.tags_json = serialize_tags(payload.tags)
+        if payload.pinned is not None:
+            murmur.pinned = payload.pinned
+        murmur.updated_at = now_utc()
 
         session.add(murmur)
         session.commit()
         session.refresh(murmur)
-        return murmur
+        return murmur_read(murmur)
 
 
 @app.delete("/api/murmurs/{murmur_id}", status_code=204)
@@ -281,8 +389,9 @@ def stats() -> dict[str, Any]:
 @app.get("/api/export.json")
 def export_json() -> dict[str, Any]:
     with Session(engine) as session:
-        records = [murmur_to_backup_record(row) for row in session.exec(select(Murmur).order_by(Murmur.created_at.desc())).all()]
-    return build_backup(records)
+        rows = session.exec(select(Murmur)).all()
+    rows.sort(key=lambda row: (bool(row.pinned), row.created_at), reverse=True)
+    return build_backup([murmur_to_backup_record(row) for row in rows])
 
 
 @app.post("/api/restore")
@@ -311,16 +420,21 @@ def restore_backup(payload: MurmurRestore) -> dict[str, Any]:
             if record["id"] in existing_ids:
                 skipped += 1
                 continue
-            session.add(Murmur(
-                id=record["id"],
-                title=record["title"].strip(),
-                transcript=record["transcript"].strip(),
-                space=record["space"].strip(),
-                source=record["source"].strip(),
-                language=record.get("language"),
-                duration_seconds=record.get("duration_seconds"),
-                created_at=parse_backup_timestamp(record["created_at"]),
-            ))
+            session.add(
+                Murmur(
+                    id=record["id"],
+                    title=record["title"].strip(),
+                    transcript=record["transcript"].strip(),
+                    space=record["space"].strip(),
+                    source=record["source"].strip(),
+                    language=record.get("language"),
+                    duration_seconds=record.get("duration_seconds"),
+                    created_at=parse_backup_timestamp(record["created_at"]),
+                    updated_at=parse_backup_timestamp(record["updated_at"]),
+                    tags_json=serialize_tags(record.get("tags", [])),
+                    pinned=record.get("pinned", False),
+                )
+            )
             existing_ids.add(record["id"])
             restored += 1
 
@@ -332,10 +446,23 @@ def restore_backup(payload: MurmurRestore) -> dict[str, Any]:
 @app.get("/api/export.csv")
 def export_csv() -> Response:
     with Session(engine) as session:
-        rows = session.exec(select(Murmur).order_by(Murmur.created_at.desc())).all()
+        rows = session.exec(select(Murmur)).all()
+    rows.sort(key=lambda row: (bool(row.pinned), row.created_at), reverse=True)
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(["id", "title", "transcript", "space", "source", "language", "duration_seconds", "created_at"])
+    writer.writerow([
+        "id",
+        "title",
+        "transcript",
+        "space",
+        "source",
+        "language",
+        "duration_seconds",
+        "created_at",
+        "updated_at",
+        "tags",
+        "pinned",
+    ])
     for row in rows:
         writer.writerow([
             safe_csv_cell(row.id),
@@ -346,12 +473,19 @@ def export_csv() -> Response:
             safe_csv_cell(row.language or ""),
             row.duration_seconds or "",
             row.created_at.isoformat(),
+            row.updated_at.isoformat(),
+            safe_csv_cell("; ".join(deserialize_tags(row.tags_json))),
+            "true" if row.pinned else "false",
         ])
-    return Response(buffer.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=murmurs.csv"})
+    return Response(
+        buffer.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=murmurs.csv"},
+    )
 
 
 @app.post("/api/transcribe", response_model=MurmurRead)
-async def transcribe_audio(audio: UploadFile = File(...), space: Optional[str] = Form(None)) -> Murmur:
+async def transcribe_audio(audio: UploadFile = File(...), space: Optional[str] = Form(None)) -> dict[str, Any]:
     try:
         suffix = choose_audio_suffix(audio.content_type or "", audio.filename)
     except AudioUploadError as exc:
@@ -377,17 +511,23 @@ async def transcribe_audio(audio: UploadFile = File(...), space: Optional[str] =
 
     try:
         model = get_model()
-        segments, info = model.transcribe(temp_path, beam_size=5, vad_filter=True, vad_parameters={"min_silence_duration_ms": 450})
+        segments, info = model.transcribe(
+            temp_path,
+            beam_size=5,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 450},
+        )
         transcript = " ".join(segment.text.strip() for segment in segments).strip()
         if not transcript:
             raise HTTPException(status_code=422, detail="No speech was detected")
-        return save_murmur(
+        murmur = save_murmur(
             transcript,
             "voice",
             space,
             getattr(info, "language", None),
             getattr(info, "duration", None),
         )
+        return murmur_read(murmur)
     finally:
         try:
             os.unlink(temp_path)
