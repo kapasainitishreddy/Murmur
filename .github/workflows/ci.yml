@@ -1,17 +1,21 @@
 name: Murmur CI
 
+# Zero-CI completion mode: prepare and review the full candidate first, then
+# invoke this workflow deliberately as a remote release gate.
 on:
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
 concurrency:
   group: murmur-ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -23,6 +27,7 @@ jobs:
 
   backend:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: backend
