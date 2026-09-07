@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { BookOpen, BriefcaseBusiness, Bug, Check, ChevronRight, CircleUserRound, Download, FileText, Home, LoaderCircle, Mic, Moon, MoreHorizontal, PawPrint, Search, Settings, ShieldCheck, Sparkles, Square, Sun, Trash2, Upload, Waves, Wifi, WifiOff, X } from 'lucide-react';
+import { BookOpen, BriefcaseBusiness, Bug, Check, ChevronRight, CircleUserRound, Download, FileText, Home, LoaderCircle, Mic, Moon, MoreHorizontal, PawPrint, Pin, Search, Settings, ShieldCheck, Sparkles, Square, Sun, Trash2, Upload, Waves, Wifi, WifiOff, X } from 'lucide-react';
 import { checkHealth, createTextMurmur, deleteMurmur, eraseAllMurmurs, exportBackup, fetchMurmurs, restoreBackup, transcribeRecording, updateMurmur } from './lib/api';
 
 const spaces = [
@@ -38,6 +38,13 @@ function messageOf(reason, fallback) {
   return reason instanceof Error && reason.message ? reason.message : fallback;
 }
 
+function tagsFromInput(value) {
+  return value
+    .split(',')
+    .map(tag => tag.trim())
+    .filter(Boolean);
+}
+
 export default function App() {
   const [dark, setDark] = useState(true);
   const [recording, setRecording] = useState(false);
@@ -53,6 +60,8 @@ export default function App() {
   const [editTitle, setEditTitle] = useState('');
   const [editTranscript, setEditTranscript] = useState('');
   const [editSpace, setEditSpace] = useState('Memory');
+  const [editTags, setEditTags] = useState('');
+  const [editPinned, setEditPinned] = useState(false);
   const [error, setError] = useState('');
   const recorderRef = useRef(null);
   const streamRef = useRef(null);
@@ -80,7 +89,7 @@ export default function App() {
   }, [refresh]);
 
   const filtered = useMemo(() => items.filter(item => {
-    const text = `${item.title} ${item.transcript} ${item.space}`.toLowerCase();
+    const text = `${item.title} ${item.transcript} ${item.space} ${(item.tags || []).join(' ')}`.toLowerCase();
     return text.includes(query.toLowerCase()) && (activeSpace === 'All murmurs' || item.space === activeSpace);
   }), [items, query, activeSpace]);
 
@@ -165,6 +174,8 @@ export default function App() {
     setEditTitle(item.title);
     setEditTranscript(item.transcript);
     setEditSpace(item.space);
+    setEditTags((item.tags || []).join(', '));
+    setEditPinned(Boolean(item.pinned));
     setError('');
   }
 
@@ -177,9 +188,15 @@ export default function App() {
         title: editTitle,
         transcript: editTranscript,
         space: editSpace,
+        tags: editTags,
+        pinned: editPinned,
       });
-      setItems(prev => prev.map(item => item.id === saved.id ? saved : item));
-      setSelected(saved);
+      const tags = tagsFromInput(editTags);
+      const normalizedSaved = { ...saved, tags: saved.tags || tags, pinned: Boolean(saved.pinned) };
+      setItems(prev => prev
+        .map(item => item.id === normalizedSaved.id ? normalizedSaved : item)
+        .sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) || new Date(b.created_at) - new Date(a.created_at)));
+      setSelected(normalizedSaved);
       setOnline(true);
     } catch (reason) {
       setError(messageOf(reason, 'Could not update this murmur.'));
@@ -281,7 +298,7 @@ export default function App() {
         {error && <div className="error-banner" role="status">{error}</div>}
         <div className="section-heading"><div><h2>Recent murmurs</h2><span>{filtered.length} saved captures</span></div></div>
         <div className="murmur-grid">
-          {filtered.length === 0 ? <article className="murmur-card"><div><span className="space-pill">YOUR LIBRARY</span><h3>No murmurs yet</h3><p>{items.length ? 'No saved murmurs match this search or space.' : 'Record or type your first murmur. Nothing is pre-filled with demo history.'}</p></div></article> : filtered.map(item => <article className="murmur-card" key={item.id} onClick={() => openRecord(item)}><div className="card-top"><span className={`type-icon ${iconClass(item.space)}`}>{typeIcon(item.space)}</span><button aria-label={`Open ${item.title}`} onClick={event => {event.stopPropagation();openRecord(item)}}><MoreHorizontal size={18}/></button></div><div><span className="space-pill">{item.space} · {item.source || 'text'}</span><h3>{item.title}</h3><p>{item.transcript}</p></div><footer><span>{friendlyTime(item.created_at)}</span><button onClick={event => {event.stopPropagation();openRecord(item)}}>Open <ChevronRight size={15}/></button></footer></article>)}
+          {filtered.length === 0 ? <article className="murmur-card"><div><span className="space-pill">YOUR LIBRARY</span><h3>No murmurs yet</h3><p>{items.length ? 'No saved murmurs match this search or space.' : 'Record or type your first murmur. Nothing is pre-filled with demo history.'}</p></div></article> : filtered.map(item => <article className="murmur-card" key={item.id} onClick={() => openRecord(item)}><div className="card-top"><span className={`type-icon ${iconClass(item.space)}`}>{typeIcon(item.space)}</span><button aria-label={`Open ${item.title}`} onClick={event => {event.stopPropagation();openRecord(item)}}><MoreHorizontal size={18}/></button></div><div><span className="space-pill">{item.space} · {item.source || 'text'}</span>{item.pinned && <span className="space-pill"><Pin size={12}/> Pinned</span>}<h3>{item.title}</h3><p>{item.transcript}</p>{item.tags?.length > 0 && <p>{item.tags.map(tag => `#${tag}`).join(' ')}</p>}</div><footer><span>{friendlyTime(item.created_at)}</span><button onClick={event => {event.stopPropagation();openRecord(item)}}>Open <ChevronRight size={15}/></button></footer></article>)}
         </div>
       </section>
     </main>
@@ -289,7 +306,7 @@ export default function App() {
 
     {showComposer && <div className="modal-backdrop" onMouseDown={() => !recording && !processing && closeComposer()}><div className="composer" onMouseDown={e => e.stopPropagation()}><div className="composer-head"><div><span className="eyebrow"><Sparkles size={13}/> CAPTURE</span><h2>{recording ? 'Listening…' : processing ? 'Processing voice…' : 'New murmur'}</h2></div><button className="icon-button" aria-label="Close capture" disabled={processing} onClick={closeComposer}><X size={20}/></button></div><textarea autoFocus value={transcript} onChange={e => setTranscript(e.target.value)} disabled={recording || processing} placeholder="Speak or type anything. Murmur will choose the right space…"/>{error && <div className="error-banner">{error}</div>}<div className="composer-actions"><button className={recording ? 'record-control active' : 'record-control'} disabled={processing} onClick={recording ? stopCapture : beginCapture}>{processing ? <><LoaderCircle className="spin" size={17}/>Processing</> : recording ? <><Square size={17}/>Stop and transcribe</> : <><Mic size={17}/>Record voice</>}</button><button className="save-button" onClick={saveTypedMurmur} disabled={!transcript.trim() || processing || recording}><Check size={17}/>Save murmur</button></div></div></div>}
 
-    {selected && <div className="modal-backdrop" onMouseDown={() => !processing && setSelected(null)}><div className="composer" onMouseDown={e => e.stopPropagation()}><div className="composer-head"><div><span className="eyebrow"><FileText size={13}/> SAVED MURMUR</span><h2>Edit record</h2></div><button className="icon-button" aria-label="Close record" disabled={processing} onClick={() => setSelected(null)}><X size={20}/></button></div><label>Title<input value={editTitle} onChange={e => setEditTitle(e.target.value)} /></label><label>Space<select value={editSpace} onChange={e => setEditSpace(e.target.value)}>{spaces.map(space => <option key={space.name}>{space.name}</option>)}</select></label><label>Transcript<textarea value={editTranscript} onChange={e => setEditTranscript(e.target.value)} /></label><div className="composer-actions"><button className="record-control" disabled={processing} onClick={removeRecord}><Trash2 size={17}/>Delete</button><button className="save-button" disabled={processing || !editTitle.trim() || !editTranscript.trim()} onClick={saveRecord}><Check size={17}/>Save changes</button></div></div></div>}
+    {selected && <div className="modal-backdrop" onMouseDown={() => !processing && setSelected(null)}><div className="composer" onMouseDown={e => e.stopPropagation()}><div className="composer-head"><div><span className="eyebrow"><FileText size={13}/> SAVED MURMUR</span><h2>Edit record</h2></div><button className="icon-button" aria-label="Close record" disabled={processing} onClick={() => setSelected(null)}><X size={20}/></button></div><label>Title<input value={editTitle} onChange={e => setEditTitle(e.target.value)} /></label><label>Space<select value={editSpace} onChange={e => setEditSpace(e.target.value)}>{spaces.map(space => <option key={space.name}>{space.name}</option>)}</select></label><label>Tags<input value={editTags} onChange={e => setEditTags(e.target.value)} placeholder="travel, important" /></label><label><input type="checkbox" checked={editPinned} onChange={e => setEditPinned(e.target.checked)} /> Pinned</label><label>Transcript<textarea value={editTranscript} onChange={e => setEditTranscript(e.target.value)} /></label><div className="composer-actions"><button className="record-control" disabled={processing} onClick={removeRecord}><Trash2 size={17}/>Delete</button><button className="save-button" disabled={processing || !editTitle.trim() || !editTranscript.trim()} onClick={saveRecord}><Check size={17}/>Save changes</button></div></div></div>}
 
     {showData && <div className="modal-backdrop" onMouseDown={() => !processing && setShowData(false)}><div className="composer" onMouseDown={e => e.stopPropagation()}><div className="composer-head"><div><span className="eyebrow"><ShieldCheck size={13}/> DATA OWNERSHIP</span><h2>Backup and privacy</h2></div><button className="icon-button" aria-label="Close data settings" disabled={processing} onClick={() => setShowData(false)}><X size={20}/></button></div><p>Your saved Murmurs live on the backend you configured. Export a portable JSON backup before destructive changes.</p><input ref={importRef} type="file" accept="application/json,.json" hidden onChange={importBackup}/><div className="composer-actions"><button className="record-control" disabled={processing} onClick={downloadBackup}><Download size={17}/>Export JSON</button><button className="record-control" disabled={processing} onClick={() => importRef.current?.click()}><Upload size={17}/>Restore JSON</button></div><div className="composer-actions"><button className="record-control" disabled={processing} onClick={eraseLibrary}><Trash2 size={17}/>Erase all murmurs</button></div></div></div>}
   </div>;
