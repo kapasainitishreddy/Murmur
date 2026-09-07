@@ -14,6 +14,12 @@ assert.match(app, /eraseAllMurmurs/);
 assert.match(app, /No murmurs yet/);
 assert.equal(app.includes('Offline preview'), false, 'offline state must not pretend demo data is user data');
 
+assert.match(app, /editTags/);
+assert.match(app, /editPinned/);
+assert.match(app, /tags:\s*editTags/);
+assert.match(app, /pinned:\s*editPinned/);
+assert.match(app, /Pinned/);
+
 assert.match(api, /export async function updateMurmur/);
 assert.match(api, /export async function exportBackup/);
 assert.match(api, /export async function restoreBackup/);
