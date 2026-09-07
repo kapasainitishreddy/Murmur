@@ -5,7 +5,6 @@ import io
 import os
 import tempfile
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -16,6 +15,7 @@ from sqlmodel import Field, Session, SQLModel, create_engine, select
 
 from .portability import safe_csv_cell
 from .skills import process_with_skill, skill_catalog
+from .upload_policy import AudioUploadError, choose_audio_suffix
 
 try:
     from faster_whisper import WhisperModel
@@ -219,7 +219,11 @@ def export_csv() -> Response:
 
 @app.post("/api/transcribe", response_model=MurmurRead)
 async def transcribe_audio(audio: UploadFile = File(...), space: Optional[str] = Form(None)) -> Murmur:
-    suffix = Path(audio.filename or "capture.webm").suffix or ".webm"
+    try:
+        suffix = choose_audio_suffix(audio.content_type or "", audio.filename)
+    except AudioUploadError as exc:
+        raise HTTPException(status_code=415, detail=str(exc)) from exc
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
         total = 0
         while chunk := await audio.read(1024 * 1024):
@@ -230,6 +234,13 @@ async def transcribe_audio(audio: UploadFile = File(...), space: Optional[str] =
                 raise HTTPException(status_code=413, detail="Audio file is too large")
             temp.write(chunk)
         temp_path = temp.name
+
+    if total == 0:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        raise HTTPException(status_code=422, detail="Audio file is empty")
 
     try:
         model = get_model()
